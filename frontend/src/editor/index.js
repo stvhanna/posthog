@@ -1,34 +1,49 @@
-import React, { Component } from "react";
-import ReactDOM from "react-dom";
-import Simmer from 'simmerjs';
-import root from 'react-shadow';
-import { ActionEdit } from "../ActionEdit";
-import Draggable from 'react-draggable';
+import React, { Component } from 'react'
+import ReactDOM from 'react-dom'
+import Simmer from '@mariusandra/simmerjs'
+import root from 'react-shadow'
+import { ActionEdit } from '~/scenes/actions/ActionEdit'
+import Draggable from 'react-draggable'
+import { getContext } from 'kea'
+import { Provider } from 'react-redux'
+import { hot } from 'react-hot-loader/root'
 
-window.simmer = new Simmer(window, {depth: 8});
+window.simmer = new Simmer(window, { depth: 8 })
 
 let styles = `
-    .form-group { padding: 1rem 12px;margin: 0 }
+    form { margin-bottom: 0 }
+    .form-group { padding: 8px 12px; margin: 0 }
     .form-group.selected { background: rgba(0, 0, 0, 0.1)}
     .form-group:not(:last-child) {border-bottom: 1px solid rgba(0, 0, 0, 0.1) }
     .form-control { font-size: 13px }
     .react-draggable .drag-bar { cursor: grab; margin-bottom: 0.75rem; user-select: none }
     .react-draggable-dragging .drag-bar {cursor: grabbing !important }
-    .logo { margin: -15px 15px 0 0 }
+    .logo { margin: -7px 15px 0 0; height: 35px }
     .drag-bar h3 { display: inline-block }
+    .save-buttons {
+        margin: 0 -12px;
+        width: calc(100% + 24px);
+    }
+    .save-buttons .btn { border-radius: 0 }
+    .action {
+        background: rgba(0, 0, 0, 0.1);
+        margin: 0 -12px;
+        padding: 6px 12px;
+        border-bottom: 1px solid rgba(0, 0, 0, 0.1);
+        height: 32px;
+    }
     .box {
         touch-action: none;
         position: fixed;
         top: 2rem;
         z-index: 999999999;
-        padding: 12px;
+        padding: 12px 12px 0 12px;
         right: 2rem;
         overflow-y: scroll;
         width: 280px;
         color: #37352F;
         font-size: 13px;
         max-height: calc(100vh - 4rem);
-        border: 1px solid rgba(0, 0, 0, 0.1);
         box-shadow: rgba(0, 0, 0, 0.4) 0px 0px 13px;
         border-radius: 10px;
         font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "Fira Sans", "Droid Sans", "Helvetica Neue", sans-serif;
@@ -50,37 +65,143 @@ let styles = `
         /* Opera doesn't support this in the shorthand */
         background-attachment: local, local, scroll, scroll;
     }
-`;
-class App extends Component {
+
+    /* form fields */
+    label { margin-bottom: 8px }
+    input.form-control {
+        padding: 8px;
+        height: calc(1.5rem + 4px);
+    }
+`
+
+class _App extends Component {
     constructor(props) {
         super(props)
+
+        this.state = {
+            actions: JSON.parse(sessionStorage.getItem('editorActions')) || [],
+            openActionId: false,
+        }
+        if (props.actionId) {
+            this.state.actions = [{ id: props.actionId }]
+            this.state.openActionId = props.actionId
+        } else {
+            if (this.state.actions.filter((action) => action.id === false).length == 0)
+                this.state.actions.push({ id: false })
+        }
+    }
+    onActionSave = (action, isNew, createNew) => {
+        let { actions, openActionId } = this.state
+        if (isNew) {
+            actions = actions.map((a) => (!a.id ? action : a))
+            openActionId = action.id
+        } else {
+            actions = actions.map((a) => (a.id == action.id ? action : a))
+        }
+        if (createNew) {
+            actions.push({ id: false })
+        }
+        openActionId = false
+        this.setState({ actions, openActionId })
+        sessionStorage.setItem('editorActions', JSON.stringify(actions))
     }
     render() {
-        let editorActionId = sessionStorage.getItem('editorActionId')
-        return <root.div>
-            <link href="https://stackpath.bootstrapcdn.com/bootstrap/4.4.1/css/bootstrap.min.css" rel="stylesheet" crossorigin="anonymous" />
-            <style>{styles}</style>
-            <Draggable handle='.drag-bar'>
-                <div className='box'>
-                        <div className='drag-bar'>
-                            <img className="logo" src="https://posthog.com/wp-content/uploads/elementor/thumbs/Instagram-Post-1hedgehog-off-black-ok61e8eds76dma39iqao8cwbeihgdc2a9grtrwy6p4.png" />
-                            <h3>PostHog</h3><br />
+        let { actions, openActionId } = this.state
+        return (
+            <root.div>
+                <link
+                    href={(this.props.jsURL || this.props.apiURL) + 'static/main.css'}
+                    rel="stylesheet"
+                    crossOrigin="anonymous"
+                />
+                <style>{styles}</style>
+                <Draggable handle=".drag-bar">
+                    <div className="box">
+                        <div className="drag-bar">
+                            <img className="logo" src={this.props.apiURL + 'static/posthog-logo.png'} />
+                            <h3>PostHog</h3>
+                            <br />
                         </div>
-                        <ActionEdit
-                            apiURL={this.props.apiURL}
-                            temporaryToken={this.props.temporaryToken}
-                            actionId={(editorActionId && editorActionId != 'null') ? editorActionId : false}
-                            simmer={window.simmer}
-                            isEditor={true} />
-                </div>
-            </Draggable>
-        </root.div>
+                        {actions.map((action, index) =>
+                            action.id == openActionId ? (
+                                <div>
+                                    <div className="action">
+                                        {!action.id && 'New Action'}
+                                        {action.id && (
+                                            <a
+                                                onClick={(e) => {
+                                                    e.preventDefault()
+                                                    this.setState({
+                                                        openActionId: false,
+                                                    })
+                                                }}
+                                                href="#"
+                                                className="float-right"
+                                            >
+                                                collapse
+                                            </a>
+                                        )}
+                                    </div>
+                                    <ActionEdit
+                                        apiURL={this.props.apiURL}
+                                        temporaryToken={this.props.temporaryToken}
+                                        actionId={action.id}
+                                        simmer={window.simmer}
+                                        onSave={this.onActionSave}
+                                        showNewActionButton={index == actions.length - 1}
+                                        isEditor={true}
+                                    />
+                                </div>
+                            ) : (
+                                <div className="action">
+                                    {action.id ? action.name : 'New Action'}
+                                    <a
+                                        onClick={(e) => {
+                                            e.preventDefault()
+                                            this.setState({
+                                                openActionId: action.id,
+                                            })
+                                        }}
+                                        href="#"
+                                        className="float-right"
+                                    >
+                                        Edit
+                                    </a>
+                                    {'  '}
+                                    {action.id && (
+                                        <a
+                                            href={this.props.apiURL + 'action/' + action.id}
+                                            onClick={() => sessionStorage.setItem('editorActions', '[]')}
+                                            className="float-right mr-1"
+                                        >
+                                            View
+                                        </a>
+                                    )}
+                                </div>
+                            )
+                        )}
+                    </div>
+                </Draggable>
+            </root.div>
+        )
     }
 }
 
-window.ph_load_editor = function(editorParams) {
-    let container = document.createElement('div');
-    document.body.appendChild(container);
+const App = hot(_App)
 
-    ReactDOM.render(<App apiURL={editorParams.apiURL} temporaryToken={editorParams.temporaryToken} />, container);
+window.ph_load_editor = function (editorParams) {
+    let container = document.createElement('div')
+    document.body.appendChild(container)
+
+    ReactDOM.render(
+        <Provider store={getContext().store}>
+            <App
+                jsURL={editorParams.jsURL}
+                apiURL={editorParams.apiURL}
+                temporaryToken={editorParams.temporaryToken}
+                actionId={editorParams.actionId}
+            />
+        </Provider>,
+        container
+    )
 }

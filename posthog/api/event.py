@@ -1,17 +1,56 @@
-from posthog.models import Event, Team, Person, Element, Action, ActionStep, PersonDistinctId
-from rest_framework import request, response, serializers, viewsets # type: ignore
-from rest_framework.decorators import action # type: ignore
-from django.http import HttpResponse, JsonResponse
-from django.db.models import Q, Count, QuerySet, query, Prefetch, F, Func, TextField, functions
-from django.forms.models import model_to_dict
-from typing import Any, Union, Tuple, Dict, List
-import re
+import json
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
+
+import pandas as pd
+from dateutil.relativedelta import relativedelta
+from django.db import connection
+from django.db.models import F, Prefetch, Q, QuerySet
+from django.db.models.expressions import Window
+from django.db.models.functions import Lag
+from django.utils.timezone import now
+from rest_framework import request, response, serializers, viewsets
+from rest_framework.decorators import action
+
+from posthog.models import (
+    Action,
+    Element,
+    ElementGroup,
+    Event,
+    Filter,
+    Person,
+    PersonDistinctId,
+    Team,
+)
+from posthog.queries.sessions import Sessions
+from posthog.utils import (
+    append_data,
+    convert_property_value,
+    dict_from_cursor_fetchall,
+    friendly_time,
+    get_compare_period_dates,
+    request_to_date_query,
+)
+
 
 class ElementSerializer(serializers.ModelSerializer):
-    event = serializers.CharField() 
+    event = serializers.CharField()
+
     class Meta:
         model = Element
-        fields = ['event', 'text', 'tag_name', 'attr_class', 'href', 'attr_id', 'nth_child', 'nth_of_type', 'attributes', 'order']
+        fields = [
+            "event",
+            "text",
+            "tag_name",
+            "attr_class",
+            "href",
+            "attr_id",
+            "nth_child",
+            "nth_of_type",
+            "attributes",
+            "order",
+        ]
+
 
 class EventSerializer(serializers.HyperlinkedModelSerializer):
     person = serializers.SerializerMethodField()
@@ -19,19 +58,38 @@ class EventSerializer(serializers.HyperlinkedModelSerializer):
 
     class Meta:
         model = Event
-        fields = ['id', 'distinct_id', 'properties', 'elements', 'event', 'ip', 'timestamp', 'person']
+        fields = [
+            "id",
+            "distinct_id",
+            "properties",
+            "elements",
+            "event",
+            "timestamp",
+            "person",
+        ]
 
     def get_person(self, event: Event) -> Any:
-        if hasattr(event, 'person_properties'):
-            return event.person_properties.get('email', event.distinct_id) # type: ignore
+        if hasattr(event, "person_properties"):
+            if event.person_properties:  # type: ignore
+                return event.person_properties.get("email", event.distinct_id)  # type: ignore
+            else:
+                return event.distinct_id
         try:
-            return event.person.properties.get('email', event.distinct_id)
+            return event.person.properties.get("email", event.distinct_id)
         except:
             return event.distinct_id
 
     def get_elements(self, event):
-        elements = event.element_set.all()
+        if not event.elements_hash:
+            return []
+        if hasattr(event, "elements_group_cache"):
+            if event.elements_group_cache:
+                return ElementSerializer(
+                    event.elements_group_cache.element_set.all().order_by("order"), many=True,
+                ).data
+        elements = ElementGroup.objects.get(hash=event.elements_hash).element_set.all().order_by("order")
         return ElementSerializer(elements, many=True).data
+
 
 class EventViewSet(viewsets.ModelViewSet):
     queryset = Event.objects.all()
@@ -39,122 +97,182 @@ class EventViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self) -> QuerySet:
         queryset = super().get_queryset()
-        return queryset\
-            .filter(team=self.request.user.team_set.get())\
-            .order_by('-timestamp')
 
-    def _filter_by_action(self, request: request.Request) -> query.RawQuerySet:
-            action = Action.objects.get(pk=request.GET['action_id'], team=request.user.team_set.get())
-            where = None
-            if request.GET.get('after'):
-                where = [['posthog_event.timestamp > %s', [request.GET['after']]]]
-            return Event.objects.filter_by_action(action, limit=101, where=where)
+        team = self.request.user.team_set.get()
+        queryset = queryset.add_person_id(team.pk)  # type: ignore
 
-    def _filter_request(self, request: request.Request, queryset: QuerySet) -> QuerySet:
+        if self.action == "list" or self.action == "sessions" or self.action == "actions":  # type: ignore
+            queryset = self._filter_request(self.request, queryset, team)
+
+        order_by = self.request.GET.get("orderBy")
+        order_by = ["-timestamp"] if not order_by else list(json.loads(order_by))
+        return queryset.filter(team=team).order_by(*order_by)
+
+    def _filter_request(self, request: request.Request, queryset: QuerySet, team: Team) -> QuerySet:
         for key, value in request.GET.items():
-            if key == 'event' or key == 'ip':
-                pass
-            elif key == 'after':
-                queryset = queryset.filter(timestamp__gt=request.GET['after'])
-            elif key == 'before':
-                queryset = queryset.filter(timestamp__lt=request.GET['before'])
-            elif key == 'person_id':
-                person = Person.objects.get(pk=request.GET['person_id'])
-                queryset = queryset.filter(distinct_id__in=person.distinct_ids)
-            elif key == 'distinct_id':
-                queryset = queryset.filter(distinct_id=request.GET['distinct_id'])
-            else:
-                key = 'properties__%s' % key
-                params = {}
-                params[key] = value
-                queryset = queryset.filter(**params)
+            if key == "event":
+                queryset = queryset.filter(event=request.GET["event"])
+            elif key == "after":
+                queryset = queryset.filter(timestamp__gt=request.GET["after"])
+            elif key == "before":
+                queryset = queryset.filter(timestamp__lt=request.GET["before"])
+            elif key == "person_id":
+                person = Person.objects.get(pk=request.GET["person_id"])
+                queryset = queryset.filter(
+                    distinct_id__in=PersonDistinctId.objects.filter(person_id=request.GET["person_id"]).values(
+                        "distinct_id"
+                    )
+                )
+            elif key == "distinct_id":
+                queryset = queryset.filter(distinct_id=request.GET["distinct_id"])
+            elif key == "action_id":
+                queryset = queryset.filter_by_action(Action.objects.get(pk=value))  # type: ignore
+            elif key == "properties":
+                filter = Filter(data={"properties": json.loads(value)})
+                queryset = queryset.filter(filter.properties_to_Q(team_id=team.pk))
         return queryset
 
-    def list(self, request: request.Request, *args: Any, **kwargs: Any) -> response.Response:
-        has_next = False
-        if request.GET.get('action_id'):
-            queryset: Union[QuerySet, query.RawQuerySet] = self._filter_by_action(request)
-            has_next = len(queryset) > 100
-        else:
-            queryset = self.get_queryset().prefetch_related(Prefetch('element_set', queryset=Element.objects.order_by('order')))
-            queryset = self._filter_request(request, queryset)
-            has_next = queryset.count() > 100
-
-        events = [EventSerializer(d).data for d in queryset[0: 100]]
-        return response.Response({
-            'next': has_next,
-            'results': events
-        })
-
-    @action(methods=['GET'], detail=False)
-    def elements(self, request) -> response.Response:
-        elements = Element.objects.filter(event__team=request.user.team_set.get())\
-            .filter(tag_name__in=Element.USEFUL_ELEMENTS)\
-            .values('tag_name', 'text', 'order')\
-            .annotate(count=Count('event'))\
-            .order_by('-count')
-        
-        return response.Response([{
-            'name': '%s with text "%s"' % (el['tag_name'], el['text']),
-            'count': el['count'],
-            'common': el
-        } for el in elements])
-
-    def _serialize_actions(self, event: Event, action: Action) -> Dict:
+    def _serialize_actions(self, event: Event) -> Dict:
         return {
-            'id': "{}-{}".format(action.pk, event.id),
-            'event': EventSerializer(event).data,
-            'action': {
-                'name': action.name,
-                'id': action.pk
-            }
+            "id": "{}-{}".format(event.action.pk, event.id),  # type: ignore
+            "event": EventSerializer(event).data,
+            "action": {
+                "name": event.action.name,  # type: ignore
+                "id": event.action.pk,  # type: ignore
+            },
         }
 
-    @action(methods=['GET'], detail=False)
+    def _prefetch_events(self, events: List[Event]) -> List[Event]:
+        team = self.request.user.team_set.get()
+        distinct_ids = []
+        hash_ids = []
+        for event in events:
+            distinct_ids.append(event.distinct_id)
+            if event.elements_hash:
+                hash_ids.append(event.elements_hash)
+        people = Person.objects.filter(team=team, persondistinctid__distinct_id__in=distinct_ids).prefetch_related(
+            Prefetch("persondistinctid_set", to_attr="distinct_ids_cache")
+        )
+        if len(hash_ids) > 0:
+            groups = ElementGroup.objects.filter(team=team, hash__in=hash_ids).prefetch_related("element_set")
+        else:
+            groups = ElementGroup.objects.none()
+        for event in events:
+            try:
+                event.person_properties = [person.properties for person in people if event.distinct_id in person.distinct_ids][0]  # type: ignore
+            except IndexError:
+                event.person_properties = None  # type: ignore
+            try:
+                event.elements_group_cache = [group for group in groups if group.hash == event.elements_hash][0]  # type: ignore
+            except IndexError:
+                event.elements_group_cache = None  # type: ignore
+        return events
+
+    def list(self, request: request.Request, *args: Any, **kwargs: Any) -> response.Response:
+        queryset = self.get_queryset()
+        monday = now() + timedelta(days=-now().weekday())
+        events = queryset.filter(timestamp__gte=monday.replace(hour=0, minute=0, second=0))[0:101]
+
+        if len(events) < 101:
+            events = queryset[0:101]
+
+        prefetched_events = self._prefetch_events([event for event in events])
+        path = request.get_full_path()
+
+        reverse = request.GET.get("orderBy", "-timestamp") != "-timestamp"
+        if len(events) > 100:
+            next_url: Optional[str] = request.build_absolute_uri(
+                "{}{}{}={}".format(
+                    path,
+                    "&" if "?" in path else "?",
+                    "after" if reverse else "before",
+                    events[99].timestamp.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                )
+            )
+        else:
+            next_url = None
+
+        return response.Response({"next": next_url, "results": EventSerializer(prefetched_events, many=True).data,})
+
+    @action(methods=["GET"], detail=False)
     def actions(self, request: request.Request) -> response.Response:
-        actions = Action.objects.filter(team=request.user.team_set.get()).prefetch_related(Prefetch('steps', queryset=ActionStep.objects.all()))
+        events = (
+            self.get_queryset()
+            .filter(action__deleted=False, action__isnull=False)
+            .prefetch_related(Prefetch("action_set", queryset=Action.objects.filter(deleted=False).order_by("id")))[
+                0:101
+            ]
+        )
         matches = []
-        for action in actions:
-            events = Event.objects.filter_by_action(action, limit=20)
-            for event in events:
-                matches.append({'event': event, 'action': action})
-        matches = sorted(matches, key=lambda match: match['event'].id, reverse=True)
-        return response.Response({'results': [self._serialize_actions(match['event'], match['action']) for match in matches[0: 20]]})
+        ids_seen: List[int] = []
+        for event in events:
+            if event.pk in ids_seen:
+                continue
+            ids_seen.append(event.pk)
+            for action in event.action_set.all():
+                event.action = action
+                matches.append(event)
+        prefetched_events = self._prefetch_events(matches)
+        return response.Response(
+            {"next": len(events) > 100, "results": [self._serialize_actions(event) for event in prefetched_events],}
+        )
 
-    @action(methods=['GET'], detail=False)
-    def names(self, request: request.Request) -> response.Response:
-        events = self.get_queryset()
-        events = events\
-            .values('event')\
-            .annotate(count=Count('id'))\
-            .order_by('-count')
-        
-        return response.Response([{'name': event['event'], 'count': event['count']} for event in events])
-
-    @action(methods=['GET'], detail=False)
-    def properties(self, request: request.Request) -> response.Response:
-        class JsonKeys(Func):
-            function = 'jsonb_object_keys'
-
-        events = self.get_queryset()
-        events = events\
-            .annotate(keys=JsonKeys('properties'))\
-            .values('keys')\
-            .annotate(count=Count('id'))\
-            .order_by('-count')
-
-        return response.Response([{'name': event['keys'], 'count': event['count']} for event in events])
-
-    @action(methods=['GET'], detail=False)
+    @action(methods=["GET"], detail=False)
     def values(self, request: request.Request) -> response.Response:
-        events = self.get_queryset()
-        key = "properties__{}".format(request.GET.get('key'))
-        events = events\
-            .values(key)\
-            .annotate(count=Count('id'))\
-            .order_by('-count')
+        key = request.GET.get("key")
+        params = [key, key]
+        if request.GET.get("value"):
+            where = " AND properties ->> %s LIKE %s"
+            params.append(key)
+            params.append("%{}%".format(request.GET["value"]))
+        else:
+            where = ""
 
-        if request.GET.get('value'):
-            events = events.extra(where=["properties ->> %s LIKE %s"], params=[request.GET['key'], '%{}%'.format(request.GET['value'])])
+        params.append(request.user.team_set.get().pk)
+        # This samples a bunch of events with that property, and then orders them by most popular in that sample
+        # This is much quicker than trying to do this over the entire table
+        values = Event.objects.raw(
+            """
+            SELECT
+                value, COUNT(1) as id
+            FROM ( 
+                SELECT
+                    ("posthog_event"."properties" -> %s) as "value"
+                FROM
+                    "posthog_event"
+                WHERE
+                    ("posthog_event"."properties" -> %s) IS NOT NULL {} AND
+                    ("posthog_event"."team_id" = %s)
+                LIMIT 10000
+            ) as "value"
+            GROUP BY value
+            ORDER BY id DESC
+            LIMIT 50;
+        """.format(
+                where
+            ),
+            params,
+        )
 
-        return response.Response([{'name': event[key], 'count': event['count']} for event in events[:50]])
+        return response.Response([{"name": convert_property_value(value.value)} for value in values])
+
+    @action(methods=["GET"], detail=False)
+    def sessions(self, request: request.Request) -> response.Response:
+        team = self.request.user.team_set.get()
+        session_type = self.request.GET.get("session")
+
+        filter = Filter(request=request)
+        result: Dict[str, Any] = {
+            "result": Sessions().run(
+                filter, team, session_type=self.request.GET.get("session"), offset=self.request.GET.get("offset")
+            )
+        }
+
+        # add pagination
+        if session_type is None:
+            offset = int(request.GET.get("offset", "0")) + 50
+            if len(result["result"]) > 49:
+                date_from = result["result"][0]["start_time"].isoformat()
+                result.update({"offset": offset})
+                result.update({"date_from": date_from})
+        return response.Response(result)
